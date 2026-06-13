@@ -99,11 +99,11 @@ class _FakePostProcess:
     Delegates to ``_fake_postprocess``; keep both in sync if the fake output format changes.
     """
 
-    def __call__(self, outputs, orig_sizes):
-        return _fake_postprocess(outputs, orig_sizes)
+    def __call__(self, outputs, orig_sizes, native_masks=False):
+        return _fake_postprocess(outputs, orig_sizes, native_masks=native_masks)
 
 
-def _fake_postprocess(outputs, orig_sizes):
+def _fake_postprocess(outputs, orig_sizes, native_masks=False):
     """Return one non-empty prediction per image so COCOEvalCallback has something to score."""
     n = orig_sizes.shape[0]
     return [

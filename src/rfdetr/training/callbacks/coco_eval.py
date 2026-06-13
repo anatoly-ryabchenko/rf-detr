@@ -86,12 +86,17 @@ class COCOEvalCallback(Callback):
         log_per_class_metrics: bool = True,
         keypoint_oks_sigmas: list[float] | None = None,
         in_notebook: bool | None = None,
+        eval_masks_at_model_resolution: bool = False,
     ) -> None:
         super().__init__()
         self._max_dets = max_dets
         self._segmentation = segmentation
         self._eval_interval = max(1, int(eval_interval))
         self._log_per_class_metrics = bool(log_per_class_metrics)
+        # Segmentation only: evaluate mask mAP at the mask head's native resolution during validation (predicted
+        # masks are kept native by validation_step; ground-truth masks are downsized to match in _convert_targets).
+        # Bounds val time/memory; test evaluation stays full-resolution. See TrainConfig.segm_eval_at_model_resolution.
+        self._eval_at_model_res = bool(eval_masks_at_model_resolution)
         self._class_names: list[str] = []
         self._cat_id_to_name: dict[int, str] = {}
         self._f1_local: dict[int, dict[str, Any]] = init_matching_accumulator()
@@ -316,7 +321,9 @@ class COCOEvalCallback(Callback):
             batch_idx: Batch index within the validation epoch.
         """
         preds: list[dict[str, torch.Tensor]] = self._convert_preds(outputs["results"])
-        targets = self._convert_targets(outputs["targets"])
+        # When evaluating at model resolution, predicted masks are at the head's native size; resize GT to match.
+        mask_size = self._eval_mask_size(preds)
+        targets = self._convert_targets(outputs["targets"], mask_size=mask_size)
 
         self.map_metric.update(preds, targets)
 
@@ -341,8 +348,9 @@ class COCOEvalCallback(Callback):
             with torch.no_grad():
                 ema_underlying.eval()  # AveragedModel deepcopy is not managed by PTL
                 ema_outputs = ema_underlying(samples)
-                ema_results = pl_module.postprocess(ema_outputs, orig_sizes)
+                ema_results = pl_module.postprocess(ema_outputs, orig_sizes, native_masks=self._eval_at_model_res)
             ema_preds = self._convert_preds(ema_results)
+            # `targets` were already resized to the base preds' mask size above; EMA preds share that resolution.
             self.map_metric_ema.update(ema_preds, targets)
             self._update_keypoint_coco_eval(
                 trainer,
@@ -1195,7 +1203,9 @@ class COCOEvalCallback(Callback):
             out.append(entry)
         return out
 
-    def _convert_targets(self, targets: list[dict[str, torch.Tensor]]) -> list[dict[str, torch.Tensor]]:
+    def _convert_targets(
+        self, targets: list[dict[str, torch.Tensor]], mask_size: tuple[int, int] | None = None
+    ) -> list[dict[str, torch.Tensor]]:
         """Convert targets from normalised CxCyWH to absolute xyxy boxes.
 
         Also passes ``iscrowd`` and ``masks`` through unchanged.
@@ -1203,6 +1213,12 @@ class COCOEvalCallback(Callback):
         Args:
             targets: Per-image target dicts with ``boxes`` in normalised
                 CxCyWH format and ``orig_size`` as ``[H, W]``.
+            mask_size: Optional ``(H, W)`` to resize ground-truth masks to. When
+                ``None`` (default / full-resolution eval) GT masks are resized to
+                the original image size to match the upsampled predicted masks.
+                When set (model-resolution eval) GT masks are resized to the
+                predicted masks' native size. Boxes are always in image
+                coordinates regardless.
 
         Returns:
             Per-image dicts with ``boxes`` in absolute xyxy, ``labels``, and optionally ``masks`` and ``iscrowd``.
@@ -1215,13 +1231,14 @@ class COCOEvalCallback(Callback):
             entry: dict[str, torch.Tensor] = {"boxes": boxes, "labels": t["labels"]}
             if "masks" in t:
                 masks = t["masks"].bool()
-                # PostProcess resizes predicted masks to orig_size; resize GT
-                # masks to match so that mask-IoU comparisons are size-consistent.
-                if masks.shape[-2:] != (int(h), int(w)):
+                # Resize GT masks to match the predicted masks so mask-IoU comparisons are size-consistent:
+                # the original image size for full-res eval, or the head's native size for model-resolution eval.
+                target_hw = mask_size if mask_size is not None else (int(h), int(w))
+                if masks.shape[-2:] != target_hw:
                     masks = (
                         F.interpolate(
                             masks.float().unsqueeze(1),
-                            size=(int(h), int(w)),
+                            size=target_hw,
                             mode="nearest",
                         )
                         .squeeze(1)
@@ -1232,3 +1249,25 @@ class COCOEvalCallback(Callback):
                 entry["iscrowd"] = t["iscrowd"]
             out.append(entry)
         return out
+
+    def _eval_mask_size(self, preds: list[dict[str, torch.Tensor]]) -> tuple[int, int] | None:
+        """Return the ``(H, W)`` to resize ground-truth masks to when evaluating at model resolution.
+
+        When ``eval_masks_at_model_resolution`` is set, predicted masks are kept at the mask head's native size
+        (uniform across a batch evaluated at a single model resolution), so ground-truth masks must be downsized to
+        the same size for mask-IoU. Returns ``None`` for the default full-resolution path (GT is then resized to the
+        original image size), or when no predicted masks are present.
+
+        Args:
+            preds: Converted per-image prediction dicts (``masks`` squeezed to ``[K, H, W]`` when present).
+
+        Returns:
+            The predicted masks' ``(H, W)``, or ``None``.
+        """
+        if not self._eval_at_model_res:
+            return None
+        for pred in preds:
+            masks = pred.get("masks")
+            if masks is not None and masks.ndim >= 2:
+                return (int(masks.shape[-2]), int(masks.shape[-1]))
+        return None

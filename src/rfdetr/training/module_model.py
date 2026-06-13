@@ -311,7 +311,9 @@ class RFDETRModelModule(LightningModule):
             self._log_val_loss_metrics(loss, loss_dict, batch_size=len(targets))
 
         orig_sizes = torch.stack([t["orig_size"] for t in targets])
-        results = self.postprocess(outputs, orig_sizes)
+        # Optionally evaluate masks at the head's native resolution during training (boxes stay full-res).
+        # Final test evaluation (test_step) always uses full-resolution masks.
+        results = self.postprocess(outputs, orig_sizes, native_masks=self.train_config.segm_eval_at_model_resolution)
         return {"results": results, "targets": targets}
 
     @property

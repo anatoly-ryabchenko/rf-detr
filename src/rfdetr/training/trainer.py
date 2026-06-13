@@ -278,6 +278,7 @@ def build_trainer(
             eval_interval=tc.eval_interval,
             log_per_class_metrics=tc.log_per_class_metrics,
             keypoint_oks_sigmas=tc.keypoint_oks_sigmas,
+            eval_masks_at_model_resolution=tc.segm_eval_at_model_resolution,
         )
     )
 

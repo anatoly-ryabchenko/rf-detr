@@ -688,6 +688,11 @@ class TrainConfig(BaseConfig):
     eval_max_dets: int = 500
     eval_interval: int = 1
     log_per_class_metrics: bool = True
+    # Segmentation only: when True, evaluate mask mAP at the mask head's native resolution during *training*
+    # validation instead of upsampling predicted/GT masks to the original image size. This bounds validation
+    # time and memory (no full-res mask upsample or RLE encode) and matches the resolution the mask loss is
+    # computed at. The final test evaluation always uses full-resolution masks. Box mAP is unaffected.
+    segm_eval_at_model_resolution: bool = False
     aug_config: Optional[Dict[str, Any]] = None
     augmentation_backend: Literal["cpu", "auto", "gpu"] = "cpu"
     save_dataset_grids: bool = False

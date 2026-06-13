@@ -65,3 +65,29 @@ def test_interpolate_and_binarize_masks_empty() -> None:
     out = postprocess._interpolate_and_binarize_masks(torch.zeros(0, 8, 8), 16, 16)
     assert out.shape == (0, 1, 16, 16)
     assert out.dtype == torch.bool
+
+
+def test_native_masks_keep_head_resolution() -> None:
+    """``native_masks=True`` keeps masks at the head's ``(Hm, Wm)`` instead of upsampling to ``target_sizes``."""
+    outputs = _segmentation_outputs(batch=1, queries=6, classes=3, mask_h=16, mask_w=20)
+    target_sizes = torch.tensor([[128, 96]], dtype=torch.int64)
+    postprocess = PostProcess(num_select=6)
+
+    native = postprocess(outputs, target_sizes, native_masks=True)[0]["masks"]
+    full_res = postprocess(outputs, target_sizes, native_masks=False)[0]["masks"]
+
+    assert native.shape == (6, 1, 16, 20)  # mask head resolution, not upsampled
+    assert native.dtype == torch.bool
+    assert full_res.shape == (6, 1, 128, 96)  # upsampled to target image size
+
+
+def test_native_masks_equal_thresholded_logits() -> None:
+    """Native-resolution masks are exactly the per-query logits thresholded at zero (no interpolation)."""
+    outputs = _segmentation_outputs(batch=1, queries=3, classes=2, mask_h=8, mask_w=10)
+    # num_select == queries and descending logits keep query order, so masks[k] == pred_masks[k] > 0.
+    outputs["pred_logits"] = torch.tensor([[[5.0, -5.0], [4.0, -5.0], [3.0, -5.0]]])
+    target_sizes = torch.tensor([[64, 80]], dtype=torch.int64)
+
+    native = PostProcess(num_select=3)(outputs, target_sizes, native_masks=True)[0]["masks"]
+    expected = (outputs["pred_masks"][0] > 0.0).unsqueeze(1)
+    assert torch.equal(native, expected)

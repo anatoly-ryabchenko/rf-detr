@@ -41,7 +41,9 @@ class PostProcess(nn.Module):
         self._mask_interpolate_budget_bytes = max(1, mask_interpolate_budget_mb) * 1024 * 1024
 
     @torch.no_grad()
-    def forward(self, outputs: dict[str, torch.Tensor], target_sizes: torch.Tensor) -> list[dict[str, torch.Tensor]]:
+    def forward(
+        self, outputs: dict[str, torch.Tensor], target_sizes: torch.Tensor, native_masks: bool = False
+    ) -> list[dict[str, torch.Tensor]]:
         """Convert raw model tensors into per-image detection dictionaries.
 
         Args:
@@ -49,6 +51,10 @@ class PostProcess(nn.Module):
                 ``pred_masks`` or ``pred_keypoints``.
             target_sizes: Per-image ``(height, width)`` tensor. For inference and evaluation this should be the
                 original image size so normalized boxes and keypoints are returned in source-image pixel coordinates.
+            native_masks: When ``True``, segmentation masks are returned at the mask head's native resolution instead
+                of being upsampled to ``target_sizes``. Boxes are always returned in ``target_sizes`` coordinates.
+                Used to evaluate mask mAP at model resolution during training (see ``COCOEvalCallback``); inference
+                and final evaluation leave it ``False`` to get full-resolution masks.
 
         Returns:
             One dictionary per image. Every dictionary contains ``scores``, ``labels``, and ``boxes``. Segmentation
@@ -64,7 +70,7 @@ class PostProcess(nn.Module):
         boxes = self._gather_and_scale_boxes(out_bbox, topk_boxes, target_sizes)
 
         if out_masks is not None:
-            return self._postprocess_masks(out_masks, scores, labels, boxes, topk_boxes, target_sizes)
+            return self._postprocess_masks(out_masks, scores, labels, boxes, topk_boxes, target_sizes, native_masks)
         if out_keypoints is not None:
             return self._postprocess_keypoints(out_keypoints, scores, labels, boxes, topk_boxes, target_sizes)
         return self._postprocess_boxes(scores, labels, boxes)
@@ -147,6 +153,7 @@ class PostProcess(nn.Module):
         boxes: torch.Tensor,
         topk_boxes: torch.Tensor,
         target_sizes: torch.Tensor,
+        native_masks: bool = False,
     ) -> list[dict[str, torch.Tensor]]:
         """Attach resized segmentation masks for selected detections.
 
@@ -158,10 +165,14 @@ class PostProcess(nn.Module):
             topk_boxes: Selected query indices with shape ``(B, K)``.
             target_sizes: Per-image ``(height, width)`` tensor used for mask
                 resizing.
+            native_masks: When ``True``, keep masks at the head's native
+                ``(Hm, Wm)`` resolution instead of upsampling to
+                ``target_sizes`` (no interpolation).
 
         Returns:
             One result dict per image containing scores, labels, boxes, and
-            boolean masks resized to the target image size.
+            boolean masks — resized to the target image size, or at the mask
+            head's native resolution when ``native_masks`` is set.
         """
         results = []
         for i in range(out_masks.shape[0]):
@@ -172,8 +183,12 @@ class PostProcess(nn.Module):
                 0,
                 k_idx.unsqueeze(-1).unsqueeze(-1).repeat(1, out_masks.shape[-2], out_masks.shape[-1]),
             )  # [K, Hm, Wm]
-            h, w = target_sizes[i].tolist()
-            res_i["masks"] = self._interpolate_and_binarize_masks(masks_i, int(h), int(w))  # [K, 1, H, W] bool
+            if native_masks:
+                # Evaluate at model resolution: threshold logits in place, no upsample to image size.
+                res_i["masks"] = masks_i.unsqueeze(1) > 0.0  # [K, 1, Hm, Wm] bool
+            else:
+                h, w = target_sizes[i].tolist()
+                res_i["masks"] = self._interpolate_and_binarize_masks(masks_i, int(h), int(w))  # [K, 1, H, W] bool
             results.append(res_i)
         return results
 

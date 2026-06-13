@@ -1298,3 +1298,57 @@ class TestComputeAndLogEmaResetPath:
             cb._compute_and_log(trainer, module, "val")
 
         mock_ema.reset.assert_called_once()
+
+
+class TestModelResolutionEval:
+    """Mask mAP evaluated at the head's native resolution (TrainConfig.segm_eval_at_model_resolution)."""
+
+    def test_flag_off_by_default(self) -> None:
+        """Default constructor leaves model-resolution eval disabled (full-resolution behaviour)."""
+        cb = COCOEvalCallback(segmentation=True)
+        assert cb._eval_at_model_res is False
+
+    def test_eval_mask_size_returns_pred_mask_shape_when_enabled(self) -> None:
+        """With the flag on, the GT-resize target is the predicted masks' (H, W)."""
+        cb = COCOEvalCallback(segmentation=True, eval_masks_at_model_resolution=True)
+        preds = [{"masks": torch.zeros(3, 16, 20, dtype=torch.bool)}]
+        assert cb._eval_mask_size(preds) == (16, 20)
+
+    def test_eval_mask_size_none_when_disabled(self) -> None:
+        """With the flag off, no GT-resize override is returned (GT then resized to image size)."""
+        cb = COCOEvalCallback(segmentation=True)
+        preds = [{"masks": torch.zeros(3, 16, 20, dtype=torch.bool)}]
+        assert cb._eval_mask_size(preds) is None
+
+    def test_eval_mask_size_none_without_masks(self) -> None:
+        """Detection predictions (no masks) yield no override even when the flag is on."""
+        cb = COCOEvalCallback(segmentation=True, eval_masks_at_model_resolution=True)
+        assert cb._eval_mask_size(_detection_preds(n=2)) is None
+
+    def test_convert_targets_downsizes_gt_masks_to_mask_size(self) -> None:
+        """GT masks are resized to the provided mask_size (model resolution) for IoU."""
+        cb = COCOEvalCallback(segmentation=True, eval_masks_at_model_resolution=True)
+        targets = [
+            {
+                "boxes": torch.tensor([[0.5, 0.5, 0.2, 0.2]]),
+                "labels": torch.tensor([1]),
+                "orig_size": torch.tensor([128, 96]),
+                "masks": torch.ones(1, 128, 96, dtype=torch.bool),
+            }
+        ]
+        converted = cb._convert_targets(targets, mask_size=(16, 20))
+        assert converted[0]["masks"].shape[-2:] == (16, 20)
+
+    def test_convert_targets_default_resizes_gt_masks_to_orig_size(self) -> None:
+        """Without mask_size, GT masks are resized to the original image size (full-resolution path)."""
+        cb = COCOEvalCallback(segmentation=True)
+        targets = [
+            {
+                "boxes": torch.tensor([[0.5, 0.5, 0.2, 0.2]]),
+                "labels": torch.tensor([1]),
+                "orig_size": torch.tensor([128, 96]),
+                "masks": torch.ones(1, 32, 24, dtype=torch.bool),
+            }
+        ]
+        converted = cb._convert_targets(targets)
+        assert converted[0]["masks"].shape[-2:] == (128, 96)
