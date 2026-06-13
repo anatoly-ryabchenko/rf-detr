@@ -29,11 +29,16 @@ class PostProcess(nn.Module):
         num_select: int = 300,
         num_keypoints_per_class: list[int] | None = None,
         trace_alpha: float = 0.2,
+        mask_interpolate_budget_mb: int = 256,
     ) -> None:
         super().__init__()
         self.num_select = num_select
         self.num_keypoints_per_class = num_keypoints_per_class or []
         self.trace_alpha = trace_alpha
+        # Upper bound (in bytes) on the transient float buffer used when upsampling segmentation masks to the
+        # target image size. Masks are interpolated in chunks that fit this budget so peak memory stays bounded
+        # regardless of detection count or image resolution. See ``_interpolate_and_binarize_masks``.
+        self._mask_interpolate_budget_bytes = max(1, mask_interpolate_budget_mb) * 1024 * 1024
 
     @torch.no_grad()
     def forward(self, outputs: dict[str, torch.Tensor], target_sizes: torch.Tensor) -> list[dict[str, torch.Tensor]]:
@@ -134,8 +139,8 @@ class PostProcess(nn.Module):
         scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)
         return boxes * scale_fct[:, None, :]
 
-    @staticmethod
     def _postprocess_masks(
+        self,
         out_masks: torch.Tensor,
         scores: torch.Tensor,
         labels: torch.Tensor,
@@ -168,12 +173,42 @@ class PostProcess(nn.Module):
                 k_idx.unsqueeze(-1).unsqueeze(-1).repeat(1, out_masks.shape[-2], out_masks.shape[-1]),
             )  # [K, Hm, Wm]
             h, w = target_sizes[i].tolist()
-            masks_i = F.interpolate(
-                masks_i.unsqueeze(1), size=(int(h), int(w)), mode="bilinear", align_corners=False
-            )  # [K,1,H,W]
-            res_i["masks"] = masks_i > 0.0
+            res_i["masks"] = self._interpolate_and_binarize_masks(masks_i, int(h), int(w))  # [K, 1, H, W] bool
             results.append(res_i)
         return results
+
+    def _interpolate_and_binarize_masks(self, masks: torch.Tensor, height: int, width: int) -> torch.Tensor:
+        """Upsample ``[K, Hm, Wm]`` mask logits to ``[K, 1, height, width]`` boolean masks, bounding peak memory.
+
+        Each query mask is interpolated independently, so the masks are processed in chunks sized to keep the
+        transient float activation buffer within the postprocessor's ``mask_interpolate_budget_mb``. The result is
+        bit-identical to a single :func:`F.interpolate` over all ``K`` masks followed by ``> 0`` thresholding —
+        chunking only bounds peak memory. The full-resolution ``[K, 1, height, width]`` float upsample is the
+        dominant validation memory cost and OOM driver for high-resolution segmentation inputs. When the whole
+        stack already fits the budget (e.g. small images), a single pass is used so there is no loop overhead.
+
+        Args:
+            masks: Selected mask logits for one image with shape ``(K, Hm, Wm)``.
+            height: Target height to upsample to.
+            width: Target width to upsample to.
+
+        Returns:
+            Boolean masks with shape ``(K, 1, height, width)``.
+        """
+        num_masks = masks.shape[0]
+        float_bytes_per_mask = height * width * 4  # one upsampled mask as float32 activations
+        chunk = max(1, self._mask_interpolate_budget_bytes // max(1, float_bytes_per_mask))
+        if chunk >= num_masks:
+            upsampled = F.interpolate(masks.unsqueeze(1), size=(height, width), mode="bilinear", align_corners=False)
+            return upsampled > 0.0
+        binarized = masks.new_empty((num_masks, 1, height, width), dtype=torch.bool)
+        for start in range(0, num_masks, chunk):
+            stop = min(start + chunk, num_masks)
+            upsampled = F.interpolate(
+                masks[start:stop].unsqueeze(1), size=(height, width), mode="bilinear", align_corners=False
+            )
+            binarized[start:stop] = upsampled > 0.0
+        return binarized
 
     def _postprocess_keypoints(
         self,
